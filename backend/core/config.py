@@ -6,7 +6,7 @@ from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
-ROOT_DIR = Path(__file__).resolve().parent.parent
+ROOT_DIR = Path(__file__).resolve().parent.parent.parent
 
 
 class Settings(BaseSettings):
@@ -26,13 +26,18 @@ class Settings(BaseSettings):
     llm_timeout_seconds: float = Field(default=30.0, alias="LLM_TIMEOUT_SECONDS")
 
     embedding_provider: str = Field(default="local", alias="EMBEDDING_PROVIDER")
-    embedding_model: str = Field(default="all-MiniLM-L6-v2", alias="EMBEDDING_MODEL")
+    embedding_model: str = Field(default="", alias="EMBEDDING_MODEL")
     embedding_api_key: str = Field(default="", alias="EMBEDDING_API_KEY")
+    faq_max_l2_distance: float | None = Field(default=None, alias="FAQ_MAX_L2_DISTANCE")
 
     data_dir: Path = Field(default=ROOT_DIR / "data")
     office_phone: str = "020 7946 0100"
     new_build_min_budget_gbp: int = 1_000_000
     max_property_matches: int = 5
+    cors_origins: str = Field(
+        default="http://localhost:8501,http://127.0.0.1:8501",
+        alias="CORS_ORIGINS",
+    )
 
 
 @lru_cache(maxsize=1)

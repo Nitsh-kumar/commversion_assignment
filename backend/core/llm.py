@@ -1,18 +1,115 @@
-"""Provider-agnostic LLM and embedding factory with retry/rate-limit resilience."""
+"""Provider-agnostic LLM and embedding adapters with retry/rate-limit resilience."""
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import logging
 import time
-from typing import Any, Callable, TypeVar
+from typing import Any, Callable, Protocol, TypeVar
 
 from langchain_core.embeddings import Embeddings
 from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import HumanMessage, SystemMessage
+from pydantic import BaseModel
 
-from src.config import Settings, get_settings
+from backend.core.config import Settings, get_settings
 
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
+SchemaT = TypeVar("SchemaT", bound=BaseModel)
+
+
+@dataclass(frozen=True)
+class TokenUsage:
+    """Normalized token counts returned across LLM adapter implementations."""
+
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+
+    def __add__(self, other: "TokenUsage") -> "TokenUsage":
+        return TokenUsage(
+            prompt_tokens=self.prompt_tokens + other.prompt_tokens,
+            completion_tokens=self.completion_tokens + other.completion_tokens,
+            total_tokens=self.total_tokens + other.total_tokens,
+        )
+
+
+def extract_token_usage(response: Any) -> TokenUsage:
+    """Extract normalized token counts from a LangChain AIMessage or metadata payload."""
+    usage = getattr(response, "usage_metadata", None)
+    if isinstance(usage, dict):
+        p = int(usage.get("input_tokens", 0) or 0)
+        c = int(usage.get("output_tokens", 0) or 0)
+        t = int(usage.get("total_tokens", p + c) or 0)
+        return TokenUsage(prompt_tokens=p, completion_tokens=c, total_tokens=t)
+
+    meta = getattr(response, "response_metadata", None) or {}
+    token_usage = meta.get("token_usage") or meta.get("usage") or {}
+    if isinstance(token_usage, dict):
+        p = int(token_usage.get("prompt_tokens", token_usage.get("input_tokens", 0)) or 0)
+        c = int(token_usage.get("completion_tokens", token_usage.get("output_tokens", 0)) or 0)
+        t = int(token_usage.get("total_tokens", p + c) or 0)
+        return TokenUsage(prompt_tokens=p, completion_tokens=c, total_tokens=t)
+
+    return TokenUsage()
+
+
+class LLMAdapter(Protocol):
+    """Narrow LLM seam consumed by the Conversation Engine."""
+
+    def complete_structured(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        schema: type[SchemaT],
+    ) -> tuple[SchemaT, TokenUsage]:
+        """Return a validated structured schema instance and token usage."""
+        ...
+
+    def generate_text(self, system_prompt: str, user_prompt: str) -> tuple[str, TokenUsage]:
+        """Return a synthesized text response and token usage."""
+        ...
+
+
+class LangChainLLMAdapter:
+    """Production LLM adapter wrapping LangChain BaseChatModel with retry resilience."""
+
+    def __init__(self, llm: BaseChatModel) -> None:
+        self._llm = llm
+
+    def complete_structured(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        schema: type[SchemaT],
+    ) -> tuple[SchemaT, TokenUsage]:
+        structured_llm = self._llm.with_structured_output(schema, include_raw=True)
+        raw_out = call_with_retry(
+            lambda: structured_llm.invoke(
+                [
+                    SystemMessage(content=system_prompt),
+                    HumanMessage(content=user_prompt),
+                ]
+            )
+        )
+        parsed = raw_out.get("parsed")
+        if raw_out.get("parsing_error") is not None or parsed is None:
+            raise ValueError(f"Structured output parsing failed: {raw_out.get('parsing_error')}")
+        usage = extract_token_usage(raw_out.get("raw"))
+        return parsed, usage
+
+    def generate_text(self, system_prompt: str, user_prompt: str) -> tuple[str, TokenUsage]:
+        msg = call_with_retry(
+            lambda: self._llm.invoke(
+                [
+                    SystemMessage(content=system_prompt),
+                    HumanMessage(content=user_prompt),
+                ]
+            )
+        )
+        return str(msg.content).strip(), extract_token_usage(msg)
+
 
 _DEFAULT_BASE_URLS = {
     "nvidia": "https://integrate.api.nvidia.com/v1",
@@ -26,6 +123,7 @@ class LocalSentenceTransformerEmbeddings(Embeddings):
     def __init__(self, model_name: str = "all-MiniLM-L6-v2") -> None:
         from sentence_transformers import SentenceTransformer
 
+        self.model_name = model_name
         self._model = SentenceTransformer(model_name)
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
@@ -131,14 +229,16 @@ def create_embeddings(settings: Settings | None = None) -> Embeddings:
 
         if not api_key:
             raise ValueError("EMBEDDING_API_KEY (or LLM_API_KEY) is required for OpenAI embeddings.")
-        return OpenAIEmbeddings(model=model or "text-embedding-3-small", api_key=api_key)
+        resolved_model = model if model and model != "all-MiniLM-L6-v2" else "text-embedding-3-small"
+        return OpenAIEmbeddings(model=resolved_model, api_key=api_key)
 
     if provider in {"gemini", "google"}:
         from langchain_google_genai import GoogleGenerativeAIEmbeddings
 
         if not api_key:
             raise ValueError("EMBEDDING_API_KEY (or LLM_API_KEY) is required for Gemini embeddings.")
-        return GoogleGenerativeAIEmbeddings(model=model or "models/text-embedding-004", google_api_key=api_key)
+        resolved_model = model if model and model != "all-MiniLM-L6-v2" else "gemini-embedding-001"
+        return GoogleGenerativeAIEmbeddings(model=resolved_model, google_api_key=api_key)
 
     raise ValueError(
         f"Unsupported EMBEDDING_PROVIDER '{cfg.embedding_provider}'. "

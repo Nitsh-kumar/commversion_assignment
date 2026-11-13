@@ -22,7 +22,7 @@ _EMAIL_RE = re.compile(
 )
 
 # Extract candidate phone spans containing digits, spaces, +, -, parentheses
-_PHONE_CANDIDATE_RE = re.compile(r"(?:\+?\d[\d\s().-]{7,18}\d)")
+_PHONE_CANDIDATE_RE = re.compile(r"(?:\+?\d[\d\s().-]{7,24}\d)")
 
 
 def parse_budget_gbp(text: str) -> int | None:
@@ -35,12 +35,15 @@ def parse_budget_gbp(text: str) -> int | None:
         return None
 
     cleaned = text.strip().lower()
-    # Ignore obvious postcodes or phone-like long strings without currency/unit hints
+    bare_fallback: int | None = None
     for match in _BUDGET_RE.finditer(cleaned):
         raw_num, unit = match.group(1), (match.group(2) or "").lower()
+        has_currency = match.group(0).lstrip().startswith(("£", "gbp"))
+        # Leading-zero bare integer strings (e.g. '02079460100') are phone numbers, not budgets
+        if raw_num.startswith("0") and "." not in raw_num and not unit:
+            continue
         # Distinguish decimal dot (1.5m) from thousand-grouped commas (1,200,000)
         if "," in raw_num and "." not in raw_num:
-            # Handle 1,200,000 or 1,5 (only treat comma as decimal if <=2 digits after single comma + unit)
             parts = raw_num.split(",")
             if len(parts) == 2 and len(parts[1]) <= 2 and unit:
                 num_str = raw_num.replace(",", ".")
@@ -59,15 +62,19 @@ def parse_budget_gbp(text: str) -> int | None:
         elif unit in {"k", "thousand"}:
             value *= 1_000
         else:
-            # Bare numbers below 1000 without k/m are usually bedroom counts or noise, not home budgets
+            # Bare numbers below 10,000 without k/m are usually bedroom counts or noise, not home budgets
             if value < 10_000:
                 continue
 
+        min_amount = 1_000 if unit else 10_000
         amount = int(round(value))
-        if 10_000 <= amount <= 500_000_000:
-            return amount
+        if min_amount <= amount <= 500_000_000:
+            if has_currency or unit:
+                return amount
+            if bare_fallback is None:
+                bare_fallback = amount
 
-    return None
+    return bare_fallback
 
 
 def normalize_postcode(text: str) -> str | None:
@@ -94,16 +101,9 @@ def validate_phone(text: str) -> str | None:
         return None
     candidate = match.group(0).strip()
     digits = re.sub(r"\D", "", candidate)
-    if candidate.startswith("+"):
-        if 10 <= len(digits) <= 15:
-            return "+" + digits
+    if not (10 <= len(digits) <= 15):
         return None
-    # UK domestic numbers are typically 10 or 11 digits starting with 0
-    if digits.startswith("0") and 10 <= len(digits) <= 11:
-        return candidate
-    if 10 <= len(digits) <= 15:
-        return candidate
-    return None
+    return "+" + digits if candidate.startswith("+") else candidate
 
 
 def validate_email(text: str) -> str | None:
