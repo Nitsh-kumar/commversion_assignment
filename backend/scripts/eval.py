@@ -6,8 +6,8 @@ import argparse
 from dataclasses import dataclass
 import uuid
 
-from src.flow import Step
-from src.graph import AshcombeChatbot
+from backend.core.engine import AshcombeChatbot
+from backend.core.flow import Step
 
 
 @dataclass

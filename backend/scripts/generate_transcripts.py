@@ -3,15 +3,14 @@
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
 import uuid
 
-from src.config import get_settings
-from src.graph import AshcombeChatbot
-from src.llm_factory import create_embeddings
-from src.tools import AgencyKnowledgeBase
+from backend.core.config import ROOT_DIR, get_settings
+from backend.core.engine import AshcombeChatbot
+from backend.core.knowledge_base import AgencyKnowledgeBase
+from backend.core.llm import create_embeddings
 
-TRANSCRIPT_DIR = Path(__file__).resolve().parent.parent / "transcripts"
+TRANSCRIPT_DIR = ROOT_DIR / "transcripts"
 
 
 def _record_session(bot: AshcombeChatbot, title: str, filename: str, turns: list[str]) -> None:
