@@ -7,9 +7,8 @@ from pathlib import Path
 
 from langchain_core.embeddings import Embeddings
 
-from src.data_loader import load_faqs, load_properties, load_seller_coverage
-from src.tools import FaqRagIndex, PropertyCatalog, SellerCoverageChecker
-from src.validators import normalize_postcode, parse_budget_gbp, validate_email, validate_phone
+from backend.core.knowledge_base import FaqRagIndex, PropertyCatalog, SellerCoverageChecker
+from backend.core.validators import normalize_postcode, parse_budget_gbp, validate_email, validate_phone
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 
@@ -41,8 +40,11 @@ def test_parse_budget_gbp_variants() -> None:
     assert parse_budget_gbp("1,200,000") == 1_200_000
     assert parse_budget_gbp("1.2 million") == 1_200_000
     assert parse_budget_gbp("950k") == 950_000
+    assert parse_budget_gbp("£5k") == 5_000
     assert parse_budget_gbp("My budget is around £850,000") == 850_000
+    assert parse_budget_gbp("12345 High Street, budget £1.5m") == 1_500_000
     assert parse_budget_gbp("3 bedrooms") is None
+    assert parse_budget_gbp("02079460100") is None
     assert parse_budget_gbp("hello") is None
 
 
@@ -56,6 +58,7 @@ def test_normalize_postcode() -> None:
 def test_validate_phone_and_email() -> None:
     assert validate_phone("07700 900123") == "07700 900123"
     assert validate_phone("+44 20 7946 0100") == "+442079460100"
+    assert validate_phone("+44 (0) 7700 900 123") == "+4407700900123"
     assert validate_phone("12345") is None
 
     assert validate_email("Alice.Smith@Example.COM") == "alice.smith@example.com"
@@ -63,7 +66,7 @@ def test_validate_phone_and_email() -> None:
 
 
 def test_property_catalog_buyer_rules() -> None:
-    catalog = PropertyCatalog(load_properties(DATA_DIR))
+    catalog = PropertyCatalog.from_csv(DATA_DIR)
 
     # SW3 3RB has 4 available new-builds (cheapest 1,230,000) and 1 under_offer (AR-0005)
     res = catalog.search_for_buyer("new_build", "sw3 3rb", max_budget_gbp=3_000_000, limit=5)
@@ -88,7 +91,7 @@ def test_property_catalog_buyer_rules() -> None:
 
 
 def test_specific_property_lookup_and_disambiguation() -> None:
-    catalog = PropertyCatalog(load_properties(DATA_DIR))
+    catalog = PropertyCatalog.from_csv(DATA_DIR)
 
     exact = catalog.lookup_specific("Rosemount House")
     assert len(exact) == 1
@@ -100,18 +103,30 @@ def test_specific_property_lookup_and_disambiguation() -> None:
 
     missing = catalog.lookup_specific("Nonexistent Mansion 999")
     assert missing == []
+    assert catalog.lookup_specific("house") == []
+    assert len(catalog.lookup_specific("I'm interested in Aldermoor")) == 5
+
+
+def test_local_embedding_cache_id_tracks_model_name() -> None:
+    from backend.core.knowledge_base import _embedding_cache_id
+    from backend.core.llm import LocalSentenceTransformerEmbeddings
+
+    emb_a = object.__new__(LocalSentenceTransformerEmbeddings)
+    emb_a.model_name = "all-MiniLM-L6-v2"
+    emb_b = object.__new__(LocalSentenceTransformerEmbeddings)
+    emb_b.model_name = "BAAI/bge-small-en-v1.5"
+    assert _embedding_cache_id(emb_a) != _embedding_cache_id(emb_b)
 
 
 def test_seller_coverage_check() -> None:
-    checker = SellerCoverageChecker(load_seller_coverage(DATA_DIR))
+    checker = SellerCoverageChecker.from_csv(DATA_DIR)
     assert checker.is_covered("gu5 7aq") is True
     assert checker.is_covered("SW3 3RB") is True
     assert checker.is_covered("E1 6AN") is False
 
 
 def test_faq_rag_retrieval() -> None:
-    faqs = load_faqs(DATA_DIR)
-    rag = FaqRagIndex(faqs, DeterministicHashEmbeddings())
+    rag = FaqRagIndex.from_csv(DATA_DIR, DeterministicHashEmbeddings())
     hits = rag.retrieve("Chelsea branch opening hours", k=3, max_l2_distance=2.0)
     assert len(hits) >= 1
     ids = [entry.faq_id for entry, _ in hits]

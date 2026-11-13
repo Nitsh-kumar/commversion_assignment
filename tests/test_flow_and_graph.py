@@ -5,10 +5,10 @@ from __future__ import annotations
 from pathlib import Path
 import uuid
 
-from src.config import Settings
-from src.flow import Step
-from src.graph import AshcombeChatbot
-from src.tools import AgencyKnowledgeBase
+from backend.core.config import Settings
+from backend.core.engine import AshcombeChatbot
+from backend.core.flow import Step
+from backend.core.knowledge_base import AgencyKnowledgeBase
 from tests.test_validators_and_tools import DeterministicHashEmbeddings
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
@@ -191,3 +191,128 @@ def test_input_validation_reprompts_and_rule_override_blocked() -> None:
     r_bad_email = bot.chat(sid, "notanemail").reply
     assert "valid email" in r_bad_email.lower()
     assert bot.get_state(sid).current_step == Step.E2_ASK_EMAIL
+
+
+def test_lowercase_surname_property_questions_and_terminal_mixed_turn() -> None:
+    bot = _make_offline_bot()
+    sid = f"test-{uuid.uuid4().hex[:8]}"
+    bot.start_session(sid)
+
+    r_name = bot.chat(sid, "My name is alice smith and I want to buy")
+    assert r_name.state.visitor_name == "Alice Smith"
+    assert r_name.state.intent == "buy"
+
+    # Property questions without 'bedroom'/'price of' still route to property_lookup
+    r_prop = bot.chat(sid, "Is Rosemount House available?")
+    assert "property_lookup" in r_prop.trace.tools_used
+    assert "Rosemount House" in r_prop.reply
+
+    bot.chat(sid, "no")
+    bot.chat(sid, "new-build")
+
+    # Mixed turn that triggers terminal M1 must not append 'To continue where we left off'
+    r_terminal = bot.chat(sid, "£5k, also what are your branch hours?")
+    assert r_terminal.state.current_step == Step.ENDED
+    assert r_terminal.state.closing_code == "M1"
+    assert "to continue where we left off" not in r_terminal.reply.lower()
+
+
+def test_structured_output_parsing_error_triggers_heuristic_fallback() -> None:
+    from backend.core.flow import ConversationData, Step
+    from backend.core.llm import LangChainLLMAdapter
+    from backend.core.nlu import analyze_turn_with_llm
+
+    class _FakeStructuredRunnable:
+        def invoke(self, _messages):
+            return {"raw": None, "parsed": None, "parsing_error": ValueError("bad json")}
+
+    class _FakeChatModel:
+        def with_structured_output(self, _schema, include_raw=True):
+            assert include_raw is True
+            return _FakeStructuredRunnable()
+
+    adapter = LangChainLLMAdapter(_FakeChatModel())  # type: ignore[arg-type]
+    analysis, _usage = analyze_turn_with_llm(
+        adapter,
+        "Oliver",
+        ConversationData(current_step=Step.ASK_NAME),
+    )
+    assert analysis.visitor_name == "Oliver"
+
+
+def test_resale_under_1m_not_blocked_and_multi_slot_c5_preserves_status() -> None:
+    bot = _make_offline_bot()
+    sid = f"test-{uuid.uuid4().hex[:8]}"
+    bot.start_session(sid)
+    bot.chat(sid, "Elena")
+    bot.chat(sid, "buy")
+    r_resale = bot.chat(sid, "Show me resale homes under £1m")
+    assert r_resale.state.closing_code is None
+    assert "can't override" not in r_resale.reply.lower()
+
+    # Multi-slot C1->C5 with under-offer property + budget preserves explanation
+    sid2 = f"test-{uuid.uuid4().hex[:8]}"
+    bot.start_session(sid2)
+    bot.chat(sid2, "Sam")
+    bot.chat(sid2, "buy")
+    bot.chat(sid2, "yes")
+    r_c5 = bot.chat(sid2, "AR-0005 with budget £1.8m")
+    assert r_c5.state.current_step == Step.A3_ASK_POSTCODE
+    assert "under offer" in r_c5.reply.lower()
+
+
+def test_e3_reassist_no_with_buy_sell_words_and_c1_mixed_faq() -> None:
+    bot = _make_offline_bot()
+    sid = f"test-{uuid.uuid4().hex[:8]}"
+    bot.start_session(sid)
+    for msg in ["Dan", "buy", "yes", "AR-0008", "07700 900111", "dan@example.com"]:
+        bot.chat(sid, msg)
+    assert bot.get_state(sid).current_step == Step.E3_REASSIST
+
+    # Explicit "No" mentioning buy/sell must end the chat cleanly instead of restarting
+    r_no = bot.chat(sid, "No, I don't want to buy or sell anything else")
+    assert r_no.state.current_step == Step.ENDED
+    assert r_no.state.closing_code == "GOODBYE"
+
+    # Reassist with "Yes, a new-build" forwards category cleanly
+    sid2 = f"test-{uuid.uuid4().hex[:8]}"
+    bot.start_session(sid2)
+    for msg in ["Dan", "buy", "yes", "AR-0008", "07700 900111", "dan@example.com"]:
+        bot.chat(sid2, msg)
+    r_cat = bot.chat(sid2, "Yes, a new-build")
+    assert r_cat.state.current_step == Step.A1_ASK_BUDGET
+
+    # Mixed turn at C1 naming property + FAQ answers fees AND advances property lookup
+    sid3 = f"test-{uuid.uuid4().hex[:8]}"
+    bot.start_session(sid3)
+    bot.chat(sid3, "Cara")
+    bot.chat(sid3, "buy")
+    bot.chat(sid3, "yes")
+    r_mixed = bot.chat(sid3, "Rosemount House, and what are your selling fees?")
+    assert "faq_rag" in r_mixed.trace.tools_used
+    assert "1.5%" in r_mixed.reply
+    assert r_mixed.state.selected_property_id == "AR-0008"
+
+
+def test_faq_retrieval_exception_falls_back_gracefully() -> None:
+    from backend.core.flow import ConversationData, Step, TurnAnalysisSchema
+    from backend.core.nlu import answer_side_question
+
+    bot = _make_offline_bot()
+    original_retrieve = bot.kb.faq_rag.retrieve
+    try:
+        def _boom(*_args, **_kwargs):
+            raise RuntimeError("embedding API unreachable")
+
+        bot.kb.faq_rag.retrieve = _boom  # type: ignore[method-assign]
+        reply, tools_used, _usage = answer_side_question(
+            "What are your fees?",
+            TurnAnalysisSchema(message_kind="faq_question", side_question_text="What are your fees?"),
+            bot.kb,
+            bot.settings,
+            llm=None,
+        )
+        assert "020 7946 0100" in reply
+        assert "faq_rag" in tools_used
+    finally:
+        bot.kb.faq_rag.retrieve = original_retrieve  # type: ignore[method-assign]
